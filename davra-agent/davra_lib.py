@@ -8,10 +8,18 @@ import json
 from pprint import pprint
 import sys
 import uuid
+import threading
+import tempfile
+from urllib.parse import urlsplit
 from datetime import datetime
 
 # Update this when anything changes in the agent
-davraAgentVersion = "2_0_3" 
+davraAgentVersion = "TLS_1_0"
+
+# Short, process-local critical sections for Agent state and local log files.
+# Never hold either lock while doing HTTP, MQTT or running an application.
+stateLock = threading.RLock()
+_logLock = threading.RLock()
 
 installationDir = "/usr/bin/davra"
 # Config file for the agent running on this device
@@ -79,7 +87,7 @@ def reportDeviceConfigurationToServer():
 # Send a log message to the server
 def logToServer(severity, message):
     # Do not send log to server if severity not in the required set
-    if(severity not in "ERROR,WARN,INFO"):
+    if severity not in ("ERROR", "WARN", "INFO"):
         return
     dataToSend = { 
         "UUID": conf['UUID'],
@@ -105,28 +113,38 @@ def logWarning(log_msg):
 def logError(log_msg):
     # Python 3 strings are already decoded, no need to decode
     if isinstance(log_msg, bytes):
-        log_msg = log_msg.decode('utf8')
+        log_msg = log_msg.decode('utf8', errors='replace')
     log(log_msg, "ERROR")
 
 # Log a message to disk and console
-def log(log_msg, severity = "DEBUG"):
+def log(log_msg, severity = "DEBUG", forward = True):
     log_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_msg = str(log_msg)
     try:
-        file_size = os.path.getsize(logDir + "/davra_agent.log")
-    except:
-        os.system("touch " + logDir + "/davra_agent.log")
+        print(log_time + ": " + severity + ": " + log_msg, flush=True)
+    except (OSError, ValueError):
+        pass
     try:
-        print((log_time + ": " + log_msg)) # Echo to stdout as well as the file
-        if file_size > 10000000:
-            os.system("mv " + logDir + "/davra_agent.log " + logDir + "/davra_agent.log.old")
-        logfile = open(logDir + "/davra_agent.log", "a")
-        logfile.write(log_time + ": " + log_msg + "\n")
-        logfile.close()
-        # Only send log to server if above the log level required
-        logToServer(severity, log_msg)
-    except Exception as e:
-        print("Error: Logging to file failed " + str(e))
+        with _logLock:
+            filename = os.path.join(logDir, "davra_agent.log")
+            try:
+                file_size = os.path.getsize(filename)
+            except FileNotFoundError:
+                file_size = 0
+            if file_size > 10000000:
+                os.replace(filename, filename + ".old")
+            with open(filename, "a") as logfile:
+                logfile.write(log_time + ": " + severity + ": " + log_msg + "\n")
+    except (OSError, ValueError) as error:
+        try:
+            print(log_time + ": ERROR: local_log_failed error=" + type(error).__name__, flush=True)
+        except (OSError, ValueError):
+            pass
+    if forward:
+        try:
+            logToServer(severity, log_msg)
+        except Exception as error:
+            log("remote_log_failed error=" + type(error).__name__, "ERROR", forward=False)
 
 
 def getHeadersForRequests():
@@ -166,57 +184,71 @@ class emptyRequestsObject(object):
     status_code = 500
     content = ""
 
+
+def _requestReferences(data):
+    """A bounded diagnostic projection, never payloads or authentication."""
+    rows = data if isinstance(data, list) else [data]
+    result = []
+    for row in rows[:8]:
+        if not isinstance(row, dict):
+            continue
+        item = {}
+        for key in ("name", "msg_type", "UUID"):
+            value = row.get(key)
+            if isinstance(value, str):
+                item[key] = value[:128]
+        tags = row.get("tags")
+        if isinstance(tags, dict) and isinstance(tags.get("functionUuid"), str):
+            item["functionUuid"] = tags["functionUuid"][:64]
+        if item:
+            result.append(item)
+    return result
+
+
+def _httpRequest(method, destination, data=None):
+    """Exactly one HTTP call. Errors are local-only to avoid log recursion."""
+    started = time.monotonic()
+    endpoint = 'invalid_destination'
+    try:
+        endpoint = urlsplit(destination).path
+        headers = getHeadersForRequests()
+        if method == "GET":
+            response = requests.get(destination, headers=headers, timeout=20)
+        else:
+            function = requests.put if method == "PUT" else requests.post
+            response = function(destination, data=json.dumps(data), headers=headers, timeout=20)
+        if not 200 <= response.status_code < 300:
+            log("http_failed method=" + method + " endpoint=" + endpoint +
+                " status=" + str(response.status_code) +
+                " elapsed_ms=" + str(int((time.monotonic() - started) * 1000)) +
+                " references=" + json.dumps(_requestReferences(data)), "ERROR", forward=False)
+        return response
+    except Exception as error:
+        log("http_failed method=" + method + " endpoint=" + endpoint +
+            " status=transport_error error=" + type(error).__name__ +
+            " elapsed_ms=" + str(int((time.monotonic() - started) * 1000)) +
+            " references=" + json.dumps(_requestReferences(data)), "ERROR", forward=False)
+        result = emptyRequestsObject()
+        result.transport_error = type(error).__name__
+        return result
+
 # Make a http request of type PUT
 # Supply the destination API endpoint as string and the dataToSend as JSON object
 def httpPut(destination, dataToSend):
-    headers = getHeadersForRequests()
-    try:
-        r = requests.put(destination, data=json.dumps(dataToSend), headers=headers, timeout=20)
-        if (r.status_code == 200):
-            #print('Sent data to server ' + r.content)
-            return(r)
-        else:
-            log("Issue while sending data to server. " + str(r))
-            return(r)
-    except Exception as e:
-        log('Failed to make http PUT:' + str(destination) + " : " \
-        + json.dumps(dataToSend) + " \n Error: " + str(e))
-        return(emptyRequestsObject())
+    return _httpRequest("PUT", destination, dataToSend)
 
 
 
 # Make a http request of type POST
 # Supply the destination API endpoint as string and the dataToSend as JSON object
 def httpPost(destination, dataToSend):
-    headers = getHeadersForRequests()
-    try:
-        r = requests.post(destination, data=json.dumps(dataToSend), headers=headers, timeout=20)
-        if (r.status_code == 200):
-            #print('Sent data to server ' + r.content)
-            return(r)
-        else:
-            log("Issue while sending data to server. " + str(r))
-            return(r)
-    except Exception as e:
-        log('Failed to make http PUT:' + str(destination) + " : " \
-        + json.dumps(dataToSend) + " \n Error: " + str(e))
-        return(emptyRequestsObject())
+    return _httpRequest("POST", destination, dataToSend)
 
 
 # Make a http request of type GET
 # Supply the destination API endpoint as string
 def httpGet(destination):
-    headers = getHeadersForRequests()
-    try:
-        r = requests.get(destination, headers=headers, timeout=20)
-        if (r.status_code == 200):
-            return(r)
-        else:
-            log("Issue while making http GET. " + str(r))
-            return(r)
-    except Exception as e:
-        log('Failed to make http GET:' + str(destination) + " : \n Error: " + str(e))
-        return(emptyRequestsObject())
+    return _httpRequest("GET", destination)
 
 
 # Send the device capabilities from config file up to server at /api/v1/devices
@@ -437,14 +469,41 @@ def ensureDirectoryExists(dir):
 
 
 # Edit a json file to upsert a parameter
+def readJsonFile(filename):
+    with stateLock:
+        with open(filename) as data_file:
+            return json.load(data_file)
+
+
+def writeJsonAtomic(filename, value):
+    """Publish a complete Agent state file; never a truncated intermediate JSON."""
+    with stateLock:
+        directory = os.path.dirname(os.path.abspath(filename))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".agent-state-", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as outfile:
+                json.dump(value, outfile, indent=4)
+                outfile.flush()
+                os.fsync(outfile.fileno())
+            os.replace(temporary, filename)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def upsertJsonEntries(filename, updates, expectedFunctionUuid=None):
+    with stateLock:
+        content = readJsonFile(filename)
+        if expectedFunctionUuid is not None and content.get("functionParameterValues", {}).get("functionUuid") != expectedFunctionUuid:
+            raise ValueError("function_identity_mismatch")
+        content.update(updates)
+        writeJsonAtomic(filename, content)
+        return content
+
+
 def upsertJsonEntry(jsonFileToEdit, jsonKey, jsonValue):
-    fileContent = None
-    with open(jsonFileToEdit) as data_file:
-        fileContent = json.load(data_file)
-    fileContent[jsonKey] = jsonValue
-    with open(jsonFileToEdit, 'w') as outfile:
-        json.dump(fileContent, outfile, indent=4)
-    return
+    return upsertJsonEntries(jsonFileToEdit, {jsonKey: jsonValue})
 
 
 # Reduce a string to only safe characters
