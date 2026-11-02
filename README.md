@@ -1,5 +1,9 @@
 # Davra Device Agent (Python 3)
 
+This is the TLS tenant's fork, `davidskog/device-agent-python3`. Our current
+Agent release is **TLS_1_0**. See [release and upgrade notes](docs/TLS_1_0.md).
+The upstream support notice below applies to the inherited Davra codebase.
+
 > **Open Source — Unsupported Release**
 >
 > This repository has been open-sourced for community reference and learning purposes. **Davra does not provide support, bug fixes, security patches, or any maintenance for this codebase in its current state.** Pull requests and issues will not be actively reviewed or merged. Use at your own risk. If you build on or fork this project, you assume full responsibility for ongoing maintenance and security.
@@ -74,11 +78,22 @@ The agent communicates with the Davra platform over MQTT and HTTP REST. Device a
 
 ### Install from the Pre-built Artifact
 
+For a separately planned **new installation**, use the versioned artifact from
+our fork. Verify its checksum before extraction:
+
 ```bash
-curl -LO downloads.davra.com/agents/device-agent-python3/main/davra-agent.tar.gz
-tar -xvf davra-agent.tar.gz
+curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_0/davra-agent-TLS_1_0.tar.gz
+curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_0/davra-agent-TLS_1_0.tar.gz.sha256
+sha256sum -c davra-agent-TLS_1_0.tar.gz.sha256
+tar -xzf davra-agent-TLS_1_0.tar.gz
 sudo davra-agent/install.sh
 ```
+
+**Existing configured hosts:** do not use this installer as an upgrade. It
+installs dependencies and runs setup. Use the two-file, config-preserving
+upgrade described in [TLS_1_0](docs/TLS_1_0.md). The inherited installer's older
+dependency/platform assumptions are unchanged; new-host provisioning must
+qualify those separately. Python/Paho versions on VK2/VK1/VK4 are preserved.
 
 The installer will:
 
