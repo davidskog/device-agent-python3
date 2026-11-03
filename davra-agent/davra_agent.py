@@ -604,11 +604,16 @@ def registerAllAgentCapabilities():
 
 ###########################   MQTT Broker running on device
 
+# The deployed server path closes an idle connection at about 60 seconds,
+# before Paho's default 60-second PING can reliably reach it. Keep the
+# connection alive below that boundary; this does not replay commands.
+SERVER_MQTT_KEEPALIVE_SECONDS = 30
 _mqttLock = threading.RLock()
 _mqttStates = {role: {'client': None, 'thread': None, 'connected': False,
                       'subscribed': False, 'stopping': False, 'starts': 0,
                       'nextStart': 0, 'delay': 2, 'disconnections': 0,
-                      'lastProblem': None, 'lastProblemAt': 0}
+                      'lastProblem': None, 'lastProblemAt': 0,
+                      'subscribeMid': None, 'disconnectedAt': None}
                for role in ('device', 'server')}
 
 
@@ -616,9 +621,9 @@ class MqttCleanupError(RuntimeError):
     pass
 
 
-def _mqttProblem(role, reason, error=None):
+def _mqttProblem(role, reason, error=None, code=None):
     state = _mqttStates[role]
-    key = (reason, type(error).__name__ if error is not None else '')
+    key = (reason, type(error).__name__ if error is not None else '', code)
     now = time.monotonic()
     with _mqttLock:
         announce = state['lastProblem'] != key or now - state['lastProblemAt'] >= 60
@@ -626,7 +631,9 @@ def _mqttProblem(role, reason, error=None):
             state['lastProblem'], state['lastProblemAt'] = key, now
     if announce:
         comDavra.log('mqtt_problem role=' + role + ' reason=' + reason +
-                     ' error=' + key[1] + ' version=' + comDavra.davraAgentVersion,
+                     ' error=' + key[1] +
+                     (' reason_code=' + str(code) if code is not None else '') +
+                     ' version=' + comDavra.davraAgentVersion,
                      'WARN', forward=False)
 
 
@@ -640,30 +647,49 @@ def _mqttConnected(client, resultCode, topic):
     role = _mqttRole(client)
     if role is None:
         return
+    with _mqttLock:
+        state = _mqttStates[role]
+        state.update({'connected': False, 'subscribed': False, 'subscribeMid': None})
     if int(resultCode) != 0:
-        _mqttProblem(role, 'connection_rejected')
+        _mqttProblem(role, 'connection_rejected', code=int(resultCode))
         return
-    result, _ = client.subscribe(topic)
+    try:
+        result, mid = client.subscribe(topic)
+    except Exception as error:
+        _mqttProblem(role, 'subscribe_failed', error)
+        client.disconnect()
+        return
     if int(result) != 0:
-        _mqttProblem(role, 'subscribe_failed')
+        _mqttProblem(role, 'subscribe_failed', code=int(result))
         client.disconnect()
         return
     with _mqttLock:
         state = _mqttStates[role]
         state['connected'] = True
+        state['subscribeMid'] = mid
         state['delay'] = 2
         state['lastProblem'] = None
         starts = state['starts']
-    comDavra.logInfo('mqtt_connected role=' + role + ' version=' + comDavra.davraAgentVersion +
-                     ' loop_starts=' + str(starts))
+        downAt = state['disconnectedAt']
+        state['disconnectedAt'] = None
+    # This callback runs on Paho's receiver. A remote log HTTP call here
+    # would delay SUBACK/PING/command handling; local logs and the existing
+    # heartbeat retain observability without adding another sender.
+    comDavra.log('mqtt_connected role=' + role + ' version=' + comDavra.davraAgentVersion +
+                 ' loop_starts=' + str(starts) +
+                 ' keepalive_s=' + str(SERVER_MQTT_KEEPALIVE_SECONDS if role == 'server' else 60) +
+                 ' reconnect_ms=' + str(round((time.monotonic() - downAt) * 1000) if downAt is not None else 0),
+                 'INFO', forward=False)
 
 
 def mqttOnSubscribe(client, userdata, mid, grantedQos, *unused):
     role = _mqttRole(client)
     if role is None:
         return
-    accepted = bool(grantedQos) and all(int(value) < 128 for value in grantedQos)
     with _mqttLock:
+        if _mqttStates[role]['subscribeMid'] != mid:
+            return
+        accepted = bool(grantedQos) and all(int(value) < 128 for value in grantedQos)
         _mqttStates[role]['subscribed'] = accepted
     if not accepted:
         _mqttProblem(role, 'subscription_rejected')
@@ -678,11 +704,14 @@ def mqttOnDisconnect(client, userdata, resultCode, *unused):
         state = _mqttStates[role]
         state['connected'] = False
         state['subscribed'] = False
+        state['subscribeMid'] = None
         stopping = state['stopping']
         if not stopping:
             state['disconnections'] += 1
+            if state['disconnectedAt'] is None:
+                state['disconnectedAt'] = time.monotonic()
     if not stopping:
-        _mqttProblem(role, 'disconnected')
+        _mqttProblem(role, 'disconnected', code=int(resultCode))
 
 
 def _mqttMessage(role, msg, processor, allowAnnouncement=False):
@@ -749,7 +778,8 @@ def _closeMqttClient(role):
                 pass
             setattr(client, socketName, None)
     with _mqttLock:
-        state.update({'client': None, 'thread': None, 'connected': False, 'subscribed': False})
+        state.update({'client': None, 'thread': None, 'connected': False,
+                      'subscribed': False, 'subscribeMid': None})
 
 
 def manageMqttClients():
@@ -995,7 +1025,8 @@ def mqttConnectToServer():
         
         try:
             comDavra.log('Connecting to MQTT broker at ' + comDavra.conf["mqttBrokerServerHost"] + ':' + str(mqttPort) + ' (TLS: ' + str(useTls) + ')')
-            clientOfServer.connect_async(comDavra.conf["mqttBrokerServerHost"], port=mqttPort)
+            clientOfServer.connect_async(comDavra.conf["mqttBrokerServerHost"], port=mqttPort,
+                                        keepalive=SERVER_MQTT_KEEPALIVE_SECONDS)
             return clientOfServer
         except ssl.SSLError as e:
             comDavra.logError('SSL/TLS error connecting to MQTT broker at ' + comDavra.conf["mqttBrokerServerHost"] + ':' + str(mqttPort) + ' - ' + str(e))

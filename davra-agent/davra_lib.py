@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from datetime import datetime
 
 # Update this when anything changes in the agent
-davraAgentVersion = "TLS_1_0"
+davraAgentVersion = "TLS_1_1"
 
 # Short, process-local critical sections for Agent state and local log files.
 # Never hold either lock while doing HTTP, MQTT or running an application.

@@ -16,6 +16,67 @@ except ImportError:
 
 
 class MqttTests(AgentFixture):
+    def test_server_keepalive_is_below_observed_idle_disconnect(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        self.assertEqual(30, self.agent.clientOfServer.keepalive)
+        self.assertEqual(60, self.agent.clientOfDevice.keepalive)
+
+    def test_connected_callback_does_not_block_on_http_log_forwarding(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        self.requests.calls.clear()
+        self.agent.mqttOnConnectServer(self.agent.clientOfServer, None, {}, 0)
+        self.assertEqual([], self.requests.calls)
+
+    def test_unrelated_subscription_ack_cannot_mark_connection_ready(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        client = self.agent.clientOfServer
+        self.agent.mqttOnConnectServer(client, None, {}, 0)
+        self.agent.mqttOnSubscribe(client, None, 99, [0])
+        self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
+        self.agent.mqttOnSubscribe(client, None, 1, [0])
+        self.assertTrue(self.agent.mqttHealth()['server']['subscribed'])
+
+    def test_disconnect_keeps_reason_and_reconnect_requires_fresh_suback(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        client = self.agent.clientOfServer
+        self.agent.mqttOnConnectServer(client, None, {}, 0)
+        self.agent.mqttOnSubscribe(client, None, 1, [0])
+        self.agent.mqttOnDisconnect(client, None, 7)
+        self.assertFalse(self.agent.mqttHealth()['server']['connected'])
+        self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
+        self.assertIn('reason_code=7', self.output.getvalue())
+        self.agent.mqttOnConnectServer(client, None, {}, 0)
+        self.agent.mqttOnSubscribe(client, None, 1, [0])
+        self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
+        self.agent.mqttOnSubscribe(client, None, 2, [0])
+        self.assertTrue(self.agent.mqttHealth()['server']['subscribed'])
+
+    def test_rejected_or_failed_subscription_does_not_report_ready(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        client = self.agent.clientOfServer
+        self.agent.mqttOnConnectServer(client, None, {}, 0)
+        self.agent.mqttOnSubscribe(client, None, 1, [128])
+        self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
+        self.assertTrue(client.disconnected)
+
+    def test_subscribe_exception_is_contained_and_client_can_be_replaced(self):
+        self.agent.manageMqttClients()
+        self.addCleanup(self.agent.closeMqttClients)
+        client = self.agent.clientOfServer
+        with mock.patch.object(client, 'subscribe', side_effect=OSError('synthetic')):
+            self.agent.mqttOnConnectServer(client, None, {}, 0)
+        self.assertFalse(self.agent.mqttHealth()['server']['connected'])
+        self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
+        self.assertTrue(client.disconnected)
+        self.agent._mqttStates['server']['nextStart'] = 0
+        self.agent.manageMqttClients()
+        self.assertIsNot(client, self.agent.clientOfServer)
+
     def test_two_distinct_owned_clients_and_no_duplicate_loops(self):
         self.agent.manageMqttClients()
         first = [s['client'] for s in self.agent._mqttStates.values()]
@@ -160,7 +221,7 @@ class MqttTests(AgentFixture):
 
 class LocalBroker:
     """Minimal MQTT 3.1.1 peer, only on a fresh loopback port; no product broker."""
-    def __init__(self):
+    def __init__(self, idle_timeout=2):
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.port = self.listener.getsockname()[1]
@@ -168,6 +229,8 @@ class LocalBroker:
         self.connections = []
         self.workers = []
         self.lock = threading.Lock()
+        self.idle_timeout = idle_timeout
+        self.pings = 0
         self.listener.settimeout(0.1)
 
     def start(self):
@@ -183,7 +246,7 @@ class LocalBroker:
                 continue
             except OSError:
                 break
-            connection.settimeout(2)
+            connection.settimeout(self.idle_timeout)
             with self.lock:
                 self.connections.append(connection)
             worker = threading.Thread(target=self.serve, args=(connection,))
@@ -216,6 +279,8 @@ class LocalBroker:
                 elif kind == 8:
                     connection.sendall(b'\x90\x03' + body[:2] + b'\x00')
                 elif kind == 12:
+                    with self.lock:
+                        self.pings += 1
                     connection.sendall(b'\xd0\x00')
                 elif kind == 14:
                     break
@@ -316,6 +381,36 @@ class NativePahoTests(AgentFixture):
             self.assertIsNone(old._sockpairR)
             self.agent.closeMqttClients()
             self.assertTrue(all(not client._thread or not client._thread.is_alive() for client in first))
+
+    def test_keepalive_prevents_idle_peer_closure_with_real_packets(self):
+        broker = LocalBroker(idle_timeout=2)
+        self.addCleanup(broker.close)
+        broker.start()
+        self.agent.mqtt.Client = native_paho.Client
+        self.lib.conf['mqttBrokerServerHost'] = '127.0.0.1'
+        self.lib.conf['mqttBrokerServerPort'] = broker.port
+        original_connect = native_paho.Client.connect_async
+        disconnected = []
+        control = native_paho.Client()
+        control.on_connect = lambda c, u, f, r: c.subscribe('/agent')
+        control.on_disconnect = lambda c, u, r: disconnected.append(r)
+        self.addCleanup(control.loop_stop)
+        self.addCleanup(control.disconnect)
+        # Scale the same keepalive/idle-boundary relation to seconds. The
+        # production value is independently asserted above and observed live.
+        with mock.patch.object(self.agent, 'SERVER_MQTT_KEEPALIVE_SECONDS', 1), \
+                mock.patch.object(native_paho.Client, 'connect_async',
+                                  lambda c, h, port=1883, **kw: original_connect(c, '127.0.0.1', broker.port, **kw)):
+            self.agent.manageMqttClients()
+            self.addCleanup(self.agent.closeMqttClients)
+            self.until(lambda: self.agent.mqttHealth()['server']['subscribed'])
+            control.connect_async('127.0.0.1', broker.port, keepalive=60)
+            control.loop_start()
+            self.until(lambda: bool(disconnected))
+            self.until(lambda: broker.pings >= 4, timeout=7)
+            self.assertEqual(0, self.agent.mqttHealth()['server']['disconnections'])
+            self.assertTrue(self.agent.mqttHealth()['server']['subscribed'])
+            self.assertEqual(1, self.agent.mqttHealth()['server']['loopStarts'])
 
 
 if __name__ == '__main__':

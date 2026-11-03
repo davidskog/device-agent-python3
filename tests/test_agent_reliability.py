@@ -91,8 +91,9 @@ class Client:
     def username_pw_set(self, **kwargs):
         self.auth = kwargs
 
-    def connect_async(self, host, port=1883):
+    def connect_async(self, host, port=1883, keepalive=60):
         self.connection = (host, port)
+        self.keepalive = keepalive
 
     def reconnect_delay_set(self, **kwargs):
         self.delays = kwargs
@@ -319,7 +320,7 @@ class FunctionTests(AgentFixture):
         self.assertEqual('running', self.lib.readJsonFile(self.agent.currentJobJson)['devices'][0]['status'])
 
     def test_version_and_config_remain_separate(self):
-        self.assertEqual('TLS_1_0', self.lib.davraAgentVersion)
+        self.assertEqual('TLS_1_1', self.lib.davraAgentVersion)
         identifier = self.start()
         self.ack(identifier)
         self.assertEqual(self.original_config, (self.root / 'config.json').read_bytes())
@@ -330,7 +331,7 @@ class FunctionTests(AgentFixture):
         message = self.agent.clientOfDevice.published[-1][1]
         self.assertFalse(any(k.startswith('_') for k in message))
         self.assertEqual("O'Connor", message['functionParameterValues']['info'])
-        self.assertEqual('TLS_1_0', message['fromAgent'])
+        self.assertEqual('TLS_1_1', message['fromAgent'])
 
     def test_atomic_json_is_never_seen_truncated_by_a_reader(self):
         filename = str(self.root / 'shared.json')
