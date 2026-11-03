@@ -48,7 +48,7 @@ class MqttTests(AgentFixture):
         self.agent.mqttOnDisconnect(client, None, 7)
         self.assertFalse(self.agent.mqttHealth()['server']['connected'])
         self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
-        self.assertIn('reason_code=7', self.output.getvalue())
+        self.assertIn('reason_code=7', self.log_output())
         self.agent.mqttOnConnectServer(client, None, {}, 0)
         self.agent.mqttOnSubscribe(client, None, 1, [0])
         self.assertFalse(self.agent.mqttHealth()['server']['subscribed'])
@@ -412,6 +412,23 @@ class NativePahoTests(AgentFixture):
             self.assertTrue(self.agent.mqttHealth()['server']['subscribed'])
             self.assertEqual(1, self.agent.mqttHealth()['server']['loopStarts'])
 
+
+
+class LoggingReadinessTests(AgentFixture):
+    def test_duplicate_suback_does_not_duplicate_ready_or_recover_early(self):
+        self.agent.manageMqttClients();self.addCleanup(self.agent.closeMqttClients)
+        client=self.agent.clientOfServer
+        self.agent.mqttOnConnectServer(client,None,{},0)
+        self.agent.mqttOnSubscribe(client,None,1,[0])
+        self.agent.mqttOnSubscribe(client,None,1,[0])
+        self.assertEqual(1,self.log_output().count('event=mqtt_ready'))
+        self.agent.mqttOnDisconnect(client,None,7)
+        self.agent.mqttOnConnectServer(client,None,{},0)
+        self.assertNotIn('event=problem_recovered',self.log_output())
+        self.agent.mqttOnSubscribe(client,None,2,[0])
+        text=self.log_output()
+        self.assertEqual(2,text.count('event=mqtt_ready'))
+        self.assertIn('event=problem_recovered',text)
 
 if __name__ == '__main__':
     unittest.main()

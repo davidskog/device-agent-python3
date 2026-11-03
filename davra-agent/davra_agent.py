@@ -72,8 +72,7 @@ def _functionRecords():
             except FileNotFoundError:
                 continue
             except (ValueError, KeyError, TypeError) as error:
-                comDavra.log("function_state_invalid file=" + os.path.basename(path) +
-                             " error=" + type(error).__name__, "ERROR", forward=False)
+                comDavra.logProblem('function_state', 'function_state_invalid', error_class=type(error).__name__)
     return result
 
 
@@ -119,10 +118,8 @@ def sendHeartbeatMetricsToServer():
         },
         "msg_type": "event"
     }]
-    comDavra.logInfo('Sending heartbeat data to: ' + comDavra.conf['server'] + ": " + comDavra.conf['UUID'])
     #print(json.dumps(dataToSend, indent=4))
     statusCode = comDavra.sendDataToServer(dataToSend).status_code
-    comDavra.log('Response after sending heartbeat data: ' + str(statusCode))
     return
 
 
@@ -141,13 +138,11 @@ def checkForPendingJob():
     if (r.status_code == 200):
         pendingJobs = json.loads(r.content) if comDavra.isJson(r.content) else []
         if(pendingJobs != [] and len(pendingJobs) > 0):
-            comDavra.log('Pending job to run: ' + str(pendingJobs[0]))  
             runDavraJob(pendingJobs[0])
         else:
-            comDavra.log('No pending job to run.') 
+            pass  # The shared HTTP path records the outcome.
         return
     else:
-        comDavra.logError("Issue while checking for pending job. " + str(r.status_code))
         return(r.status_code)
     
 
@@ -157,10 +152,10 @@ def runDavraJob(jobObject):
     # Catch situation where a job is already running
     with comDavra.stateLock:
         if flagIsJobRunning or os.path.isfile(currentJobJson):
-            comDavra.log('job_already_running incoming_job=' + jobObject['UUID'], 'WARN', forward=False)
+            comDavra.logProblem('job_busy', 'command_rejected', 'WARN', job_uuid=jobObject['UUID'], reason='job_busy')
             return
         flagIsJobRunning = True
-    comDavra.log('Start Run of job ' + jobObject["UUID"])
+    comDavra.logEvent('job_received', job_uuid=jobObject['UUID'])
     try:
         # Write this job to disk as the current job
         jobObject['devices'][0]['startTime'] = comDavra.getMilliSecondsSinceEpoch()
@@ -169,7 +164,7 @@ def runDavraJob(jobObject):
         with open(currentJobJson, 'w') as outfile:
             json.dump(jobObject, outfile, indent=4)
         if ('jobConfig' in jobObject and jobObject['jobConfig']['type'].lower() == 'runfunction'):
-            comDavra.logInfo('Job Run: type is runFunction. ' + jobObject['jobConfig']['functionName'])
+            comDavra.logEvent('job_running', job_uuid=jobObject['UUID'], function=jobObject['jobConfig']['functionName'])
             runFunction(jobObject['jobConfig']['functionName'], jobObject['jobConfig']['functionParameterValues'], jobUuid=jobObject['UUID'])
             return
         # Reaching here means the job type was not recognised so that is a failed situation
@@ -178,7 +173,7 @@ def runDavraJob(jobObject):
         return
     except Exception as e:
         # Reaching here means the job type was not recognised so that is a failed situation
-        comDavra.logError('Job Error ' + str(e))
+        comDavra.logProblem('job_run', 'agent_action_failed', job_uuid=jobObject.get('UUID'), error_class=type(e).__name__)
         updateJobWithResult('failed', 'Unknown job type')
         checkCurrentJob()
         return
@@ -226,22 +221,19 @@ def updateJobWithResult(status, responseText, expectedJobUuid=None):
 # When a job has finished, send the result to the Davra server        
 def reportJobStatus():            
     global flagIsJobRunning
-    comDavra.log('Current job is finished so reporting it to server now')
     jobObject = None
     with open(currentJobJson) as data_file:
         jobObject = json.load(data_file) 
     deviceJobObject = jobObject['devices'][0]
     headers = comDavra.getHeadersForRequests()
     apiEndPoint = comDavra.conf['server'] + '/api/v1/jobs/' + jobObject['UUID'] + '/' + deviceJobObject['UUID']
-    comDavra.logInfo('Reporting job update to server: ' + apiEndPoint + ' : ' + json.dumps(deviceJobObject))
     r = comDavra.httpPut(apiEndPoint, deviceJobObject)
     if (r.status_code == 200):
-        comDavra.log("Updated server after running job.")
+        comDavra.logEvent('job_finished', 'DEBUG', job_uuid=jobObject['UUID'], **comDavra.logHttpFields(r))
         # The job has completed and been reflected at the server so delete the currentJobJson file
         os.remove(currentJobJson)
     else:
-        comDavra.log("Issue while updating server after running job. " + str(r.status_code))
-        comDavra.log(r.content)
+        pass  # The shared HTTP path records the outcome.
     # Report job event to server as an iotdata event
     eventToSend = {
         "UUID": deviceJobObject['UUID'],
@@ -255,9 +247,9 @@ def reportJobStatus():
     apiEndPoint = comDavra.conf['server'] + '/api/v1/iotdata'
     r = comDavra.httpPut(apiEndPoint, eventToSend)
     if (r.status_code == 200):
-        comDavra.log("Sent event to server after running job.")
+        comDavra.logEvent('job_finished', 'DEBUG', job_uuid=jobObject['UUID'], **comDavra.logHttpFields(r))
     else:
-        comDavra.logError("Issue while sending event to server after running job. " + str(r.status_code))
+        pass  # The shared HTTP path records the outcome.
     comDavra.provideFreshDirectory(currentJobDir) # Remove the file and dir on disk 
     flagIsJobRunning = False
     return
@@ -274,9 +266,8 @@ def reportAgentStarted():
     }
     r = comDavra.sendDataToServer(eventToSend)
     if (r.status_code == 200):
-        comDavra.logInfo("Sent event to server to indicate agent started")
+        pass  # The shared HTTP path records the outcome.
     # Update the device labels to reflect this agent version
-    comDavra.logInfo("Running davraAgentVersion:" + comDavra.davraAgentVersion)
     comDavra.updateDeviceLabelOnServer("davraAgentVersion", comDavra.davraAgentVersion)
     return
 
@@ -294,8 +285,7 @@ def runFunction(functionName, functionParameterValues, jobUuid=None):
     parameters = dict(functionParameterValues)
     functionId = _functionUuid(parameters.setdefault("functionUuid", comDavra.generateUuid()))
     if functionName not in comDavra.conf.get("capabilities", {}):
-        comDavra.log("function_rejected reason=unknown_capability function=" + functionName,
-                     "WARN", forward=False)
+        comDavra.logProblem('command_rejected', 'command_rejected', 'WARN', function=functionName, function_uuid=functionId, reason='unknown_capability')
         return
     internal = functionName in agentCapabilityFunctions
     fingerprint = _functionFingerprint(functionName, parameters)
@@ -305,13 +295,12 @@ def runFunction(functionName, functionParameterValues, jobUuid=None):
         previous = next((row for _, row in records
                          if row["functionParameterValues"]["functionUuid"] == functionId), None)
         if previous is not None or functionId in recent:
-            comDavra.log("function_duplicate_ignored functionUuid=" + functionId, "WARN", forward=False)
+            comDavra.logEvent('command_duplicate', function=functionName, function_uuid=functionId)
             return
         if len(records) >= 256:
             raise RuntimeError("too_many_pending_functions")
         if internal and os.path.exists(currentFunctionJson):
-            comDavra.log("function_rejected reason=internal_function_busy functionUuid=" + functionId,
-                         "WARN", forward=False)
+            comDavra.logProblem('command_busy', 'command_rejected', 'WARN', function=functionName, function_uuid=functionId, reason='internal_function_busy')
             return
         functionInfo = {'functionName': functionName, 'functionParameterValues': parameters,
                         'status': 'running', 'startTime': comDavra.getMilliSecondsSinceEpoch(),
@@ -321,7 +310,7 @@ def runFunction(functionName, functionParameterValues, jobUuid=None):
         filename = currentFunctionJson if internal else _functionPath(functionId)
         comDavra.writeJsonAtomic(filename, functionInfo)
         flagIsFunctionRunning = True
-    comDavra.log("function_started function=" + functionName + " functionUuid=" + functionId)
+    comDavra.logEvent('command_received', function=functionName, function_uuid=functionId)
     if internal:
         agentCapabilityFunctions[functionName](parameters)
     else:
@@ -358,8 +347,7 @@ def checkFunctionFinished():
                 try:
                     status = reportFunctionFinishedAsEventToServer(row)
                 except Exception as error:
-                    comDavra.log("function_report_failed functionUuid=" + functionId +
-                                 " error=" + type(error).__name__, "ERROR", forward=False)
+                    comDavra.logProblem('function_report', 'http_failed', function_uuid=functionId, error_class=type(error).__name__, reason='function_report_exception')
             if row.get('_jobUuid'):
                 updateJobWithResult(row['status'], row.get('response', ''), expectedJobUuid=row['_jobUuid'])
             with comDavra.stateLock:
@@ -374,7 +362,7 @@ def checkFunctionFinished():
                 comDavra.writeJsonAtomic(os.path.join(currentFunctionDir, '.reported-functions.json'), recent)
                 os.unlink(filename)
                 _refreshFunctionFlag()
-            comDavra.log("function_finished functionUuid=" + functionId + " status=" + row['status'])
+            comDavra.logEvent('command_finished', function_uuid=functionId, result=row['status'], reporting='http_accepted' if status is not None and 200 <= status < 300 else 'not_confirmed')
         finally:
             with comDavra.stateLock:
                 _finishingFunctions.discard(functionId)
@@ -397,8 +385,7 @@ def reportFunctionFinishedAsEventToServer(currentFunctionInfo):
     }
     #comDavra.log("Sending event to server to indicate function finished: " + str(eventToSend))
     r = comDavra.sendDataToServer(eventToSend)
-    comDavra.log("function_report functionUuid=" + currentFunctionInfo['functionParameterValues']['functionUuid'] +
-                 " status=" + str(r.status_code))
+    comDavra.logEvent('command_report', function_uuid=currentFunctionInfo['functionParameterValues']['functionUuid'], **comDavra.logHttpFields(r))
     return r.status_code
     
 
@@ -415,13 +402,11 @@ def updateFunctionStatusAsReportedByDeviceApp(functionInfo):
         match = next(((path, row) for path, row in records
                       if row['functionParameterValues']['functionUuid'] == functionId), None)
         if match is None:
-            comDavra.log("function_ack_ignored reason=late_or_unknown functionUuid=" + functionId,
-                         "WARN", forward=False)
+            comDavra.logProblem('command_ack', 'command_ack_ignored', 'WARN', function_uuid=functionId, reason='late_or_unknown')
             return
         filename, row = match
         if functionInfo.get('finishedFunctionOnApp') != row['functionName']:
-            comDavra.log("function_ack_ignored reason=wrong_function functionUuid=" + functionId,
-                         "WARN", forward=False)
+            comDavra.logProblem('command_ack', 'command_ack_ignored', 'WARN', function_uuid=functionId, reason='wrong_function')
             return
         if row.get('status') in ('completed', 'failed') or functionId in _finishingFunctions:
             return
@@ -436,7 +421,7 @@ def agentFunctionReboot(functionParameterValues):
     # Put a file to indicate what is happening and start the reboot process
     with open(currentFunctionDir + '/doingReboot.json', 'w') as outfile:
         json.dump({ 'doingRebootAsPartOfFunction': True }, outfile, indent=4)
-    comDavra.logInfo('Function: Reboot Device, starting')
+    comDavra.logEvent('diagnostic', 'DEBUG', reason='agentFunctionReboot')
     comDavra.runCommandWithTimeout('sudo reboot -h now', comDavra.conf["scriptMaxTime"])
 
 
@@ -447,7 +432,7 @@ def checkIfJustBackAfterRebootTask():
         with open(currentFunctionJson) as data_file:
             currentFunctionInfo = json.load(data_file)
         if(currentFunctionInfo["functionName"] == 'agent-action-rebootDevice'):
-            comDavra.log('checkIfJustBackAfterRebootTask: True. Function completed')
+            comDavra.logEvent('diagnostic', 'DEBUG', reason='checkIfJustBackAfterRebootTask')
             comDavra.upsertJsonEntry(currentFunctionJson, 'response', str(comDavra.getUptime()))
             comDavra.upsertJsonEntry(currentFunctionJson, 'status', 'completed')
             checkFunctionFinished()             
@@ -457,7 +442,7 @@ def checkIfJustBackAfterRebootTask():
 # functionParameterValues should have "Installation File" which should be a tar.gz containing the service file,
 # an install.sh 
 def agentFunctionPushAppWithInstaller(functionParameterValues):
-    comDavra.logInfo('Function: Pushing Application onto device to run as a service ' + str(functionParameterValues))
+    comDavra.logEvent('package_received', function_uuid=functionParameterValues.get('functionUuid'))
     if(functionParameterValues["Installation File"]):
         installationFile = functionParameterValues["Installation File"]
         # Download the app tarball
@@ -473,34 +458,34 @@ def agentFunctionPushAppWithInstaller(functionParameterValues):
             comDavra.ensureDirectoryExists(installedAppPath)
             comDavra.runCommandWithTimeout('cd ' + tmpPath + ' && cp -r * ' + installedAppPath, 300)
             installResponse = comDavra.runCommandWithTimeout('cd ' + installedAppPath + ' && bash ./install.sh ', comDavra.conf["scriptMaxTime"])
-            comDavra.log('Installation response: ' + str(installResponse[1]))
+            comDavra.logEvent('package_finished', function_uuid=functionParameterValues.get('functionUuid'), exit_code=installResponse[0])
             scriptStatus = 'completed'  if (installResponse[0] == 0) else 'failed'
             comDavra.upsertJsonEntry(currentFunctionJson, 'response', str(installResponse[1]))
             comDavra.upsertJsonEntry(currentFunctionJson, 'status', scriptStatus)
         except Exception as e:
-            comDavra.logError('Failed to download application:' + installationFile + " : Error: " + str(e))
+            comDavra.logProblem('package_run', 'agent_action_failed', error_class=type(e).__name__, reason='package_failed')
             comDavra.upsertJsonEntry(currentFunctionJson, 'status', 'failed')
             checkFunctionFinished() 
-        comDavra.log('Finished agentFunctionPushAppWithInstaller')
+        comDavra.logEvent('diagnostic', 'DEBUG', reason='agentFunctionPushAppWithInstaller')
         checkFunctionFinished()
     else:
-        comDavra.logWarning('Action parameters missing, nothing to do')
+        comDavra.logProblem('package_parameters', 'command_rejected', 'WARN', reason='missing_parameters')
     # TODO
     return
 
 
 # Function: Push an Application onto this device to run as a snap
 def agentFunctionPushAppSnap(functionParameterValues):
-    comDavra.logInfo('Function: Pushing Application onto device to run as a snap ' +  str(functionParameterValues))
+    comDavra.logEvent('package_received', function_uuid=functionParameterValues.get('functionUuid'))
     if(functionParameterValues["Snap File From Repo"]):
-        comDavra.log('URL is ' + functionParameterValues["File URL"]);
+        comDavra.logEvent('diagnostic', 'DEBUG', reason='agentFunctionPushAppSnap');
     # TODO
     return
 
 
 # Function: Report the device configuration to the server
 def agentFunctionReportAgentConfig(functionParameterValues):
-    comDavra.logInfo('Function: Reporting the agent config to server')
+    comDavra.logEvent('config_reported', 'DEBUG', function_uuid=functionParameterValues.get('functionUuid'))
     comDavra.reportDeviceConfigurationToServer()
     comDavra.upsertJsonEntry(currentFunctionJson, 'response', comDavra.conf)
     comDavra.upsertJsonEntry(currentFunctionJson, 'status', 'completed')
@@ -510,7 +495,7 @@ def agentFunctionReportAgentConfig(functionParameterValues):
 
 # Function: Report the device configuration to the server
 def agentFunctionUpdateAgentConfig(functionParameterValues):
-    comDavra.logInfo('Function: Updating the agent config to server ' + str(functionParameterValues))
+    comDavra.logEvent('config_reported', 'DEBUG', function_uuid=functionParameterValues.get('functionUuid'))
     comDavra.upsertConfigurationItem(functionParameterValues["key"], functionParameterValues["value"])
     comDavra.reportDeviceConfigurationToServer()
     comDavra.upsertJsonEntry(currentFunctionJson, 'response', comDavra.conf)
@@ -525,14 +510,14 @@ def agentFunctionRunScriptBash(functionParameterValues):
     if "script" not in functionParameterValues:
         comDavra.upsertJsonEntry(currentFunctionJson, 'response', 'script missing')
         comDavra.upsertJsonEntry(currentFunctionJson, 'status', 'failed')
-        comDavra.logError('Could not run script as function because no script to run')
+        comDavra.logProblem('script_parameters', 'command_rejected', reason='missing_script')
         checkFunctionFinished()
         return
     # Put the script into the function dir 
     scriptFile = open(currentFunctionDir + "/script.sh", "a")
     scriptFile.write(str(functionParameterValues["script"]))
     scriptFile.close()
-    comDavra.logInfo('Running script ' + str(functionParameterValues["script"]))
+    comDavra.logEvent('script_received', function_uuid=functionParameterValues.get('functionUuid'))
     os.system("chmod 777 " + currentFunctionDir + "/script.sh")
     time.sleep(0.5) # Time for file flush to disk
     # Run the script with -x flag so it prints each command before ruuning it. 
@@ -540,7 +525,7 @@ def agentFunctionRunScriptBash(functionParameterValues):
     scriptResponse = comDavra.runCommandWithTimeout('cd ' + currentFunctionDir + \
     ' && sudo bash -x ' + currentFunctionDir + "/script.sh", comDavra.conf["scriptMaxTime"])
     # scriptResponse is a tuple of (exitStatusCode, stdout) . For exitStatusCode: 0 = success, 1 = failed )
-    comDavra.log("Script response: " + str(scriptResponse[1]))
+    comDavra.logEvent('script_finished', function_uuid=functionParameterValues.get('functionUuid'), exit_code=scriptResponse[0])
     scriptStatus = 'completed'  if (scriptResponse[0] == 0) else 'failed'
     comDavra.upsertJsonEntry(currentFunctionJson, 'response', str(scriptResponse[1]))
     comDavra.upsertJsonEntry(currentFunctionJson, 'status', scriptStatus)
@@ -622,19 +607,10 @@ class MqttCleanupError(RuntimeError):
 
 
 def _mqttProblem(role, reason, error=None, code=None):
-    state = _mqttStates[role]
-    key = (reason, type(error).__name__ if error is not None else '', code)
-    now = time.monotonic()
-    with _mqttLock:
-        announce = state['lastProblem'] != key or now - state['lastProblemAt'] >= 60
-        if announce:
-            state['lastProblem'], state['lastProblemAt'] = key, now
-    if announce:
-        comDavra.log('mqtt_problem role=' + role + ' reason=' + reason +
-                     ' error=' + key[1] +
-                     (' reason_code=' + str(code) if code is not None else '') +
-                     ' version=' + comDavra.davraAgentVersion,
-                     'WARN', forward=False)
+    comDavra.logProblem('mqtt_' + role, 'mqtt_problem', 'WARN', role=role,
+                        reason=reason, error_class=type(error).__name__ if error is not None else None,
+                        reason_code=code, version=comDavra.davraAgentVersion)
+
 
 
 def _mqttRole(client):
@@ -669,17 +645,10 @@ def _mqttConnected(client, resultCode, topic):
         state['subscribeMid'] = mid
         state['delay'] = 2
         state['lastProblem'] = None
-        starts = state['starts']
-        downAt = state['disconnectedAt']
-        state['disconnectedAt'] = None
     # This callback runs on Paho's receiver. A remote log HTTP call here
     # would delay SUBACK/PING/command handling; local logs and the existing
     # heartbeat retain observability without adding another sender.
-    comDavra.log('mqtt_connected role=' + role + ' version=' + comDavra.davraAgentVersion +
-                 ' loop_starts=' + str(starts) +
-                 ' keepalive_s=' + str(SERVER_MQTT_KEEPALIVE_SECONDS if role == 'server' else 60) +
-                 ' reconnect_ms=' + str(round((time.monotonic() - downAt) * 1000) if downAt is not None else 0),
-                 'INFO', forward=False)
+    comDavra.logEvent('mqtt_connected', 'DEBUG', role=role, version=comDavra.davraAgentVersion)
 
 
 def mqttOnSubscribe(client, userdata, mid, grantedQos, *unused):
@@ -689,11 +658,22 @@ def mqttOnSubscribe(client, userdata, mid, grantedQos, *unused):
     with _mqttLock:
         if _mqttStates[role]['subscribeMid'] != mid:
             return
+        alreadyReady = _mqttStates[role]['subscribed']
         accepted = bool(grantedQos) and all(int(value) < 128 for value in grantedQos)
         _mqttStates[role]['subscribed'] = accepted
     if not accepted:
         _mqttProblem(role, 'subscription_rejected')
         client.disconnect()
+    elif not alreadyReady:
+        with _mqttLock:
+            downAt = _mqttStates[role]['disconnectedAt']
+            _mqttStates[role]['disconnectedAt'] = None
+        comDavra.logEvent('mqtt_ready', role=role, version=comDavra.davraAgentVersion,
+                          loop_starts=_mqttStates[role]['starts'],
+                          keepalive_s=SERVER_MQTT_KEEPALIVE_SECONDS if role == 'server' else 60,
+                          reconnect_ms=round((time.monotonic()-downAt)*1000) if downAt is not None else 0)
+        comDavra.logRecovered('mqtt_' + role)
+    comDavra.pollLogging(mqttHealth())
 
 
 def mqttOnDisconnect(client, userdata, resultCode, *unused):
@@ -712,6 +692,7 @@ def mqttOnDisconnect(client, userdata, resultCode, *unused):
                 state['disconnectedAt'] = time.monotonic()
     if not stopping:
         _mqttProblem(role, 'disconnected', code=int(resultCode))
+    comDavra.pollLogging(mqttHealth())
 
 
 def _mqttMessage(role, msg, processor, allowAnnouncement=False):
@@ -810,8 +791,7 @@ def manageMqttClients():
                 state['thread'] = getattr(client, '_thread', None)
                 state['starts'] += 1
                 state['nextStart'] = time.monotonic() + state['delay']
-            comDavra.log('mqtt_loop_started role=' + role + ' version=' + comDavra.davraAgentVersion +
-                         ' loop_starts=' + str(state['starts']), 'INFO', forward=False)
+            comDavra.logEvent('mqtt_loop_started', role=role, version=comDavra.davraAgentVersion, loop_starts=state['starts'])
         except Exception as error:
             _mqttProblem(role, 'start_failed', error)
             if state['client'] is not None:
@@ -861,7 +841,6 @@ def processMessageFromAppToAgent(msg):
     # Ignore any messages this agent published
     if("fromAgent" in msg):
         return
-    comDavra.log('processMessageFromAppToAgent: keys=' + ','.join(sorted(msg)))
     if("registerCapability" in msg):
         capabilityName = msg["registerCapability"]
         capabilityDetails = msg["capabilityDetails"] if "capabilityDetails" in msg else {}
@@ -872,18 +851,14 @@ def processMessageFromAppToAgent(msg):
         runFunction(functionName, functionParameterValues)
     if("connectToAgent" in msg):
         applicationName = msg["connectToAgent"]
-        comDavra.log('From app to agent, app announcing it is running: ' + applicationName)
         time.sleep(0.1)
         sendHeartbeatToDeviceApps()
     if("retrieveConfigFromAgent" in msg):
-        comDavra.log('From app to agent, app requesting config')
         sendMessageFromAgentToApps({"agentConfig": comDavra.conf})
     if("finishedFunctionOnApp" in msg):
         functionName = msg["finishedFunctionOnApp"]
-        comDavra.log('From app to agent, app announcing it finished running a function: ' + functionName)
         updateFunctionStatusAsReportedByDeviceApp(msg)
     if("sendIotData" in msg):
-        comDavra.log('From app to agent, iotData available')
         sendIotDataToServer(msg)
 
 
@@ -891,13 +866,12 @@ def processMessageFromAppToAgent(msg):
 # Usually topic /agent on localhost
 # msg should be valid json
 def sendMessageFromAgentToApps(msg):
-    comDavra.log('sendMessageFromAgentToApps: keys=' + ','.join(sorted(msg)))
     msg['fromAgent'] = comDavra.davraAgentVersion
     if clientOfDevice is None:
         raise RuntimeError('mqtt_device_client_unavailable')
     result = clientOfDevice.publish('/agent', json.dumps(msg))
     if int(result.rc) != 0:
-        comDavra.log('mqtt_publish_failed role=device status=' + str(result.rc), 'ERROR', forward=False)
+        comDavra.logProblem('mqtt_publish_device', 'mqtt_problem', role='device', reason='publish_failed', reason_code=int(result.rc))
 
 
 # Send a regular message to apps to inform them the agent is still available
@@ -907,25 +881,30 @@ def sendHeartbeatToDeviceApps():
 
 # Send metrics and events to the platform server
 def sendIotDataToServer(msgFromMqtt):
-    comDavra.log('Sending iotdata to server ')
     dataFromAgent = json.loads(msgFromMqtt["sendIotData"])
     if (type (dataFromAgent) == type ({})):
         dataFromAgent = [dataFromAgent]
     dataForServer = []
+    invalidCount = 0
     for metric in dataFromAgent:
         if (("UUID" in metric) == False):
             metric["UUID"] = comDavra.conf["UUID"]
         if ("timestamp" not in metric):
             metric["timestamp"] = comDavra.getMilliSecondsSinceEpoch()
         if ("name" in metric and "value" in metric and "msg_type" in metric):
-            comDavra.log('Sending data now to server ')
             dataForServer.append(metric)
         else:
-            comDavra.log('iotdata_invalid_metric', 'ERROR', forward=False)
+            invalidCount += 1
+            comDavra.countDiagnostic('invalid_datapoints')
+    if invalidCount:
+        comDavra.logProblem('telemetry_validation', 'metric_invalid', count=invalidCount)
+    else:
+        comDavra.logRecovered('telemetry_validation')
     if dataForServer:
-        comDavra.log('Sending iotdata metrics=' + str(len(dataForServer)))
-        statusCode = comDavra.sendDataToServer(dataForServer).status_code
-        comDavra.log('Response after sending iotdata to server: ' + str(statusCode))
+        response = comDavra.sendDataToServer(dataForServer)
+        failed = bool(getattr(response, 'transport_error', None)) or not 200 <= response.status_code < 300
+        comDavra.countDiagnostic('telemetry_batches_failed' if failed else 'telemetry_batches_ok')
+        comDavra.countDiagnostic('telemetry_datapoints_failed' if failed else 'telemetry_datapoints_ok', len(dataForServer))
     
     
         
@@ -962,7 +941,6 @@ def mqttConnectToServer():
         clientOfServer = _newMqttClient('server')
         clientOfServer.on_connect = mqttOnConnectServer
         clientOfServer.on_message = mqttOnMessageServer
-        comDavra.log('Starting to connect to MQTT broker running on Davra server ' + comDavra.conf["mqttBrokerServerHost"])
         apiTokenForDevice = comDavra.conf["apiToken"]
         clientOfServer.username_pw_set(username = comDavra.conf["UUID"], password = apiTokenForDevice)
         
@@ -971,7 +949,6 @@ def mqttConnectToServer():
         mqttPort = comDavra.conf.get("mqttBrokerServerPort", 8883 if useTls else 1883)
         
         if useTls:
-            comDavra.log('Configuring MQTT with TLS/SSL encryption')
             try:
                 # Get TLS configuration from config file
                 ca_certs = comDavra.conf.get("mqttBrokerServerCaCert", None)
@@ -996,10 +973,8 @@ def mqttConnectToServer():
                 # Use PROTOCOL_TLS as default for auto-negotiation (best practice)
                 if tls_version:
                     tls_protocol = tls_version_map.get(tls_version, ssl.PROTOCOL_TLS)
-                    comDavra.log('Using TLS version: ' + tls_version)
                 else:
                     tls_protocol = ssl.PROTOCOL_TLS
-                    comDavra.log('Using TLS auto-negotiation (will use highest version supported by both client and server)')
                 
                 # Configure TLS settings
                 clientOfServer.tls_set(
@@ -1015,26 +990,23 @@ def mqttConnectToServer():
                 
                 # Option to disable certificate hostname verification (not recommended for production)
                 if not comDavra.conf.get("mqttBrokerServerVerifyHostname", True):
-                    comDavra.logWarning('MQTT TLS hostname verification is disabled - not recommended for production')
+                    comDavra.logProblem('mqtt_server_config', 'mqtt_problem', 'WARN', role='server', reason='hostname_verification_disabled')
                     clientOfServer.tls_insecure_set(True)
                     
-                comDavra.log('MQTT TLS configuration completed successfully')
             except Exception as e:
-                comDavra.logError('Error configuring MQTT TLS: ' + str(e))
+                comDavra.logProblem('mqtt_server_config', 'mqtt_problem', role='server', reason='tls_config_failed', error_class=type(e).__name__)
                 return
         
         try:
-            comDavra.log('Connecting to MQTT broker at ' + comDavra.conf["mqttBrokerServerHost"] + ':' + str(mqttPort) + ' (TLS: ' + str(useTls) + ')')
             clientOfServer.connect_async(comDavra.conf["mqttBrokerServerHost"], port=mqttPort,
                                         keepalive=SERVER_MQTT_KEEPALIVE_SECONDS)
             return clientOfServer
         except ssl.SSLError as e:
-            comDavra.logError('SSL/TLS error connecting to MQTT broker at ' + comDavra.conf["mqttBrokerServerHost"] + ':' + str(mqttPort) + ' - ' + str(e))
-            comDavra.logError('Check TLS configuration, certificates, and that the MQTT broker supports the TLS version')
+            comDavra.logProblem('mqtt_server_config', 'mqtt_problem', role='server', reason='connect_setup_failed', error_class=type(e).__name__)
         except Exception as e:
-            comDavra.logError('Experienced error connecting to mqtt at ' + comDavra.conf["mqttBrokerServerHost"] + ':' + str(mqttPort) + ' - ' + str(e))
+            comDavra.logProblem('mqtt_server_config', 'mqtt_problem', role='server', reason='connect_setup_failed', error_class=type(e).__name__)
     else:
-        comDavra.logError('No MQTT broker configured for Davra server')
+        comDavra.logProblem('mqtt_server_config', 'mqtt_problem', role='server', reason='broker_not_configured')
 
 
 
@@ -1043,15 +1015,11 @@ def mqttConnectToServer():
 # These messages may arrive by mqtt from server to agent 
 # msg should be a json object
 def processMessageFromServerToAgent(msg):
-    comDavra.log('processMessageFromServerToAgent: keys=' + ','.join(sorted(msg)))
     if("stringMsg" in msg and msg["stringMsg"] == "davra.announcement:check-for-jobs"):
-        comDavra.log('From server to device, new jobs might be available')
         checkForPendingJob()
     if("davra-announcement" in msg and msg["davra-announcement"] == "check-for-jobs"):
-        comDavra.log('From server to device, new jobs might be available')
         checkForPendingJob()
     if("davra-function" in msg):
-        comDavra.log('From server to device, run a function: ' + str(msg["davra-function"]))
         funcParamsToRun = {}
         if("functionParameterValues" in msg):
             funcParamsToRun = msg["functionParameterValues"]
@@ -1062,32 +1030,29 @@ def processMessageFromServerToAgent(msg):
 
 ###########################   MAIN LOOP
 
-_mainProblems = {}
-
-
 def _mainAction(name, action):
     try:
         action()
-        _mainProblems.pop(name, None)
+        comDavra.logRecovered('agent_' + name)
     except MqttCleanupError:
         raise
     except Exception as error:
-        now = time.monotonic()
-        previous = _mainProblems.get(name)
-        if previous is None or now - previous >= 60:
-            comDavra.log('agent_action_failed action=' + name + ' error=' + type(error).__name__,
-                         'ERROR', forward=False)
-            _mainProblems[name] = now
+        comDavra.logProblem('agent_' + name, 'agent_action_failed', reason=name,
+                            error_class=type(error).__name__)
 
 
-def main():
+
+def main(debugSeconds=0):
     if 'server' not in comDavra.conf or 'UUID' not in comDavra.conf:
-        comDavra.log('Configuration incomplete. Run setup before starting the Agent.', 'ERROR', forward=False)
+        comDavra.logEvent('agent_config_invalid', 'ERROR', reason='missing_identity_or_server')
+        comDavra.closeLogging(timeout=3)
         return 1
     interval = int(comDavra.conf['heartbeatInterval'])
     if interval <= 0:
         raise ValueError('invalid_heartbeat_interval')
-    comDavra.logInfo('Starting Davra Device Agent version=' + comDavra.davraAgentVersion)
+    if debugSeconds:
+        comDavra.enableDebugLogging(debugSeconds)
+    comDavra.logEvent('agent_started', version=comDavra.davraAgentVersion, forward=True)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda number, frame: _stopRequested.set())
     try:
@@ -1099,6 +1064,7 @@ def main():
         countMainLoop = 0
         while not _stopRequested.is_set():
             _mainAction('mqtt_supervision', manageMqttClients)
+            comDavra.pollLogging(mqttHealth())
             if countMainLoop % interval == 0:
                 _mainAction('local_heartbeat', sendHeartbeatToDeviceApps)
                 _mainAction('server_heartbeat', sendHeartbeatMetricsToServer)
@@ -1115,10 +1081,18 @@ def main():
         _stopRequested.set()
     finally:
         _stopRequested.set()
-        closeMqttClients()
-        comDavra.log('Agent stopped version=' + comDavra.davraAgentVersion, 'INFO', forward=False)
-    return 0
+        try:
+            closeMqttClients()
+        finally:
+            comDavra.logEvent('agent_stopped', version=comDavra.davraAgentVersion)
+            closed = comDavra.closeLogging(timeout=5)
+            if not closed['clean']:
+                print('<3>ERROR: Loggning hann inte avslutas; processens återstående trådar stängs', flush=True)
+    return 0 if closed['clean'] else 1
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--debug-seconds', type=int, default=0, choices=range(0, 601), metavar='0..600')
+    sys.exit(main(parser.parse_args().debug_seconds))

@@ -162,10 +162,15 @@ class AgentFixture(unittest.TestCase):
         self.console = mock.patch('sys.stdout', self.output)
         self.console.start()
         self.addCleanup(self.console.stop)
+        self.addCleanup(lambda: self.lib.closeLogging(timeout=3))
         self.agent = self.load_agent()
         self.agent.clientOfDevice = Client()
         self.reports = []
         self.agent.reportFunctionFinishedAsEventToServer = lambda row: self.reports.append(row) or 200
+
+    def log_output(self):
+        self.lib.flushLogging(timeout=3)
+        return self.output.getvalue()
 
     def load_agent(self):
         spec = importlib.util.spec_from_file_location('agent_under_test_' + uuid.uuid4().hex,
@@ -320,7 +325,7 @@ class FunctionTests(AgentFixture):
         self.assertEqual('running', self.lib.readJsonFile(self.agent.currentJobJson)['devices'][0]['status'])
 
     def test_version_and_config_remain_separate(self):
-        self.assertEqual('TLS_1_1', self.lib.davraAgentVersion)
+        self.assertEqual('TLS_1_2', self.lib.davraAgentVersion)
         identifier = self.start()
         self.ack(identifier)
         self.assertEqual(self.original_config, (self.root / 'config.json').read_bytes())
@@ -331,7 +336,7 @@ class FunctionTests(AgentFixture):
         message = self.agent.clientOfDevice.published[-1][1]
         self.assertFalse(any(k.startswith('_') for k in message))
         self.assertEqual("O'Connor", message['functionParameterValues']['info'])
-        self.assertEqual('TLS_1_1', message['fromAgent'])
+        self.assertEqual('TLS_1_2', message['fromAgent'])
 
     def test_atomic_json_is_never_seen_truncated_by_a_reader(self):
         filename = str(self.root / 'shared.json')
@@ -362,9 +367,11 @@ class HttpAndLogTests(AgentFixture):
                 self.requests.failure = OSError('SECRET_FROM_EXCEPTION')
                 response = action('https://example.invalid/api/test?token=QUERY_CANARY') if method == 'GET' else action('https://example.invalid/api/test?token=QUERY_CANARY', {'password': 'PAYLOAD_CANARY'})
                 self.assertEqual(500, response.status_code)
-                self.assertEqual(1, len(self.requests.calls))
-                self.assertEqual(method, self.requests.calls[0][0])
-        text = self.output.getvalue()
+                self.lib.flushLogging(timeout=3)
+                data_calls = [c for c in self.requests.calls if '/api/test?' in c[1]]
+                self.assertEqual(1, len(data_calls))
+                self.assertEqual(method, data_calls[0][0])
+        text = self.log_output()
         for secret in ('SECRET_FROM_EXCEPTION', 'QUERY_CANARY', 'PAYLOAD_CANARY', 'TOKEN_CANARY_NOT_REAL'):
             self.assertNotIn(secret, text)
 
@@ -372,26 +379,30 @@ class HttpAndLogTests(AgentFixture):
         self.requests.status = 503
         response = self.lib.httpPut('https://example.invalid/api/test', [{'name': 'test.metric'}])
         self.assertEqual(503, response.status_code)
-        self.assertEqual(1, len(self.requests.calls))
-        self.assertIn('status=503', self.output.getvalue())
-        self.assertIn('test.metric', self.output.getvalue())
+        self.lib.flushLogging(timeout=3)
+        self.assertEqual(1, len([c for c in self.requests.calls if c[1].endswith('/api/test')]))
+        self.assertIn('http_status=503', self.log_output())
+        self.assertIn('test.metric', self.log_output())
 
     def test_remote_log_failure_does_not_recurse(self):
         self.requests.failure = OSError('broken network')
-        self.lib.logInfo('original diagnostic')
+        self.lib.logEvent('agent_started', forward=True, version='TLS_1_2')
+        self.lib.flushLogging(timeout=3)
         self.assertEqual(1, len(self.requests.calls))
-        self.assertIn('original diagnostic', self.output.getvalue())
-        self.assertIn('http_failed', self.output.getvalue())
+        self.assertIn('agent_started', self.log_output())
+        self.assertIn('log_remote_failed', self.log_output())
 
     def test_missing_logfile_is_created(self):
-        self.lib.log('first line')
-        self.assertIn('first line', (self.root / 'davra_agent.log').read_text())
+        self.lib.logEvent('agent_started', version='TLS_1_2')
+        self.lib.flushLogging(timeout=3)
+        self.assertIn('agent_started', (self.root / 'davra_agent_TLS_1_2.log').read_text())
 
     def test_file_log_failure_does_not_prevent_console_or_return(self):
-        with mock.patch('builtins.open', side_effect=PermissionError('synthetic')):
-            self.lib.log('visible diagnostic', 'ERROR', forward=False)
-        self.assertIn('visible diagnostic', self.output.getvalue())
-        self.assertIn('local_log_failed', self.output.getvalue())
+        with mock.patch('os.open', side_effect=PermissionError('synthetic')):
+            self.lib.logEvent('agent_action_failed', 'ERROR', reason='visible_diagnostic')
+            self.lib.flushLogging(timeout=3)
+        self.assertIn('visible_diagnostic', self.log_output())
+        self.assertIn('log_local_failed', self.log_output())
 
 
 if __name__ == '__main__':
