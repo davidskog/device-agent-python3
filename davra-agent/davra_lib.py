@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from datetime import datetime
 
 # Update this when anything changes in the agent
-davraAgentVersion = "TLS_1_3"
+davraAgentVersion = "TLS_1_4"
 
 # Short, process-local critical sections for Agent state and local log files.
 # Never hold either lock while doing HTTP, MQTT or running an application.
@@ -122,7 +122,8 @@ _LOG_FIELDS = frozenset((
     'interval_s', 'mqtt_local', 'mqtt_davra', 'local_queue', 'remote_queue',
     'local_busy', 'remote_busy', 'local_workers', 'remote_workers', 'message_omitted',
     'cause_event', 'pending', 'fields_omitted', 'http_calls', 'http_ok', 'http_failed',
-    'http_elapsed_ms', 'http_max_ms', 'telemetry_batches_ok', 'telemetry_batches_failed',
+    'http_elapsed_ms', 'http_max_ms', 'http_mean_ms', 'http_cached_sessions', 'http_reused_connections',
+    'http_pool_close_failures', 'telemetry_batches_ok', 'telemetry_batches_failed',
     'telemetry_datapoints_ok', 'telemetry_datapoints_failed', 'invalid_datapoints',
     'local_dropped', 'remote_dropped', 'suppressed_debug', 'episode_overflow',
     'local_write_failures', 'remote_write_failures', 'local_worker_starts', 'remote_worker_starts',
@@ -324,12 +325,18 @@ class AgentLogger:
                          'local_write_failures', 'remote_write_failures', 'suppressed_debug',
                          'local_worker_failures', 'remote_worker_failures')
                 fields = {name: totals[name]-self.last_totals[name] for name in names}
+                transport = _httpTransport.snapshot()
                 fields.update(version=davraAgentVersion, period_s=int(now-self.last_summary),
                               uptime_s=int(now-self.started_at), mqtt_local=self.mqtt['device'], mqtt_davra=self.mqtt['server'],
                               local_queue=len(self.queues['local']), remote_queue=len(self.queues['remote']),
                               local_workers=int(bool(self.workers.get('local') and self.workers['local'].is_alive())),
                               remote_workers=int(bool(self.workers.get('remote') and self.workers['remote'].is_alive())),
-                              http_max_ms=totals['http_max_ms'])
+                              http_max_ms=totals['http_max_ms'],
+                              http_mean_ms=int((totals['http_elapsed_ms']-self.last_totals['http_elapsed_ms']) /
+                                               max(1, fields['http_calls'])),
+                              http_cached_sessions=transport['cached'],
+                              http_reused_connections=transport['reused'],
+                              http_pool_close_failures=transport['closeFailures'])
                 pending.append(('driftstatus', 'INFO', False, fields))
                 self.last_summary, self.last_totals = now, totals
         for event, level, forward, fields in pending:
@@ -554,6 +561,126 @@ class emptyRequestsObject(object):
     content = ""
 
 
+def _newHttpSession():
+    session = requests.Session()
+    try:
+        for scheme in ('http://', 'https://'):
+            session.mount(scheme, requests.adapters.HTTPAdapter(
+                max_retries=0, pool_connections=1, pool_maxsize=1, pool_block=True))
+    except BaseException:
+        try:
+            session.close()
+        except Exception:
+            pass
+        raise
+    return session
+
+
+class AgentHttpTransport(object):
+    """Reuse connections within one caller thread, never replay a request.
+
+    No shared Session, sender queue or network call under the registry lock.
+    Dead-thread sessions are closed on the next admission. Overflow callers
+    retain the former one-call lifetime instead of growing the idle cache.
+    """
+    def __init__(self, factory=None, max_cached=8):
+        if type(max_cached) is not int or not 1 <= max_cached <= 32:
+            raise ValueError('invalid_http_cache_bound')
+        self.factory = factory or _newHttpSession
+        self.max_cached = max_cached
+        self.lock = threading.Lock()
+        self.entries = {}
+        self.closed = False
+        self.active = 0
+        self.created = 0
+        self.reused = 0
+        self.close_failures = 0
+
+    def _close(self, sessions):
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                with self.lock:
+                    self.close_failures += 1
+
+    def request(self, method, destination, **kwargs):
+        owner = threading.current_thread()
+        expired = []
+        try:
+            with self.lock:
+                if self.closed:
+                    raise RuntimeError('http_transport_closed')
+                for thread, entry in list(self.entries.items()):
+                    if not thread.is_alive() and not entry['busy']:
+                        expired.append(entry['session'])
+                        del self.entries[thread]
+                entry = self.entries.get(owner)
+                if entry is not None:
+                    if entry['busy']:
+                        raise RuntimeError('http_transport_reentrant')
+                    self.reused += 1
+                else:
+                    entry = {'session': self.factory(), 'busy': False,
+                             'cached': len(self.entries) < self.max_cached}
+                    self.created += 1
+                    if entry['cached']:
+                        self.entries[owner] = entry
+                entry['busy'] = True
+                self.active += 1
+        except BaseException:
+            self._close(expired)
+            raise
+        self._close(expired)
+        session = entry['session']
+        failed = False
+        try:
+            # Independent requests never retained response cookies. Pooling
+            # sockets must not introduce cookie-based state or shared auth.
+            session.cookies.clear()
+            return session.request(method, destination, **kwargs)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                session.cookies.clear()
+            except Exception:
+                failed = True
+            with self.lock:
+                entry['busy'] = False
+                self.active -= 1
+                retire = failed or self.closed or not entry['cached']
+                if retire and self.entries.get(owner) is entry:
+                    del self.entries[owner]
+            if retire:
+                self._close([session])
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            idle = [entry['session'] for entry in self.entries.values() if not entry['busy']]
+            self.entries = {thread: entry for thread, entry in self.entries.items() if entry['busy']}
+            active = self.active
+        self._close(idle)
+        with self.lock:
+            clean = active == 0 and self.close_failures == 0
+        return {'clean': clean, 'active': active}
+
+    def snapshot(self):
+        with self.lock:
+            return {'cached': len(self.entries), 'active': self.active,
+                    'created': self.created, 'reused': self.reused,
+                    'closeFailures': self.close_failures}
+
+
+_httpTransport = AgentHttpTransport()
+
+
+def closeHttpTransport():
+    return _httpTransport.close()
+
+
 def _httpRequest(method, destination, data=None, diagnostic=True, timeout=20):
     """One request only. Log delivery never recursively reports to itself."""
     started = time.monotonic()
@@ -561,11 +688,10 @@ def _httpRequest(method, destination, data=None, diagnostic=True, timeout=20):
     try:
         endpoint = _safe_log_fields({'endpoint': urlsplit(destination).path}).get('endpoint', 'other_endpoint')
         headers = getHeadersForRequests()
-        if method == "GET":
-            response = requests.get(destination, headers=headers, timeout=timeout)
-        else:
-            function = requests.put if method == "PUT" else requests.post
-            response = function(destination, data=json.dumps(data), headers=headers, timeout=timeout)
+        options = {'headers': headers, 'timeout': timeout}
+        if method != "GET":
+            options['data'] = json.dumps(data)
+        response = _httpTransport.request(method, destination, **options)
     except Exception as error:
         response = emptyRequestsObject()
         response.transport_error = type(error).__name__

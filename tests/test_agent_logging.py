@@ -68,7 +68,7 @@ class LoggingTests(AgentFixture):
             calls.append(record);entered.set();release.wait(2)
             return types.SimpleNamespace(status_code=503)
         log = self.logger(remote)
-        started = time.monotonic();log.emit('agent_started', forward=True, version='TLS_1_3')
+        started = time.monotonic();log.emit('agent_started', forward=True, version='TLS_1_4')
         self.assertLess(time.monotonic()-started, .2);self.assertTrue(entered.wait(1))
         log.emit('command_received', function_uuid='11111111-1111-4111-8111-111111111111', function='drink')
         deadline=time.monotonic()+1
@@ -148,12 +148,12 @@ class LoggingTests(AgentFixture):
             row={'event':'diagnostic','level':level,'fields':{},'at':1}
             self.lib._write_local_log(row)
             self.assertIn('<'+str(priority)+'>',self.output.getvalue())
-        path=self.root/'davra_agent_TLS_1_3.log';self.assertEqual(0o600,path.stat().st_mode&0o777)
+        path=self.root/'davra_agent_TLS_1_4.log';self.assertEqual(0o600,path.stat().st_mode&0o777)
         self.assertFalse((self.root/'davra_agent.log').exists())
 
     def test_symlink_log_destination_is_not_followed(self):
         secret=self.root/'protected';secret.write_text('unchanged')
-        (self.root/'davra_agent_TLS_1_3.log').symlink_to(secret)
+        (self.root/'davra_agent_TLS_1_4.log').symlink_to(secret)
         with self.assertRaises(OSError):self.lib._write_local_log({'event':'diagnostic','level':'INFO','fields':{},'at':1})
         self.assertEqual('unchanged',secret.read_text())
 
@@ -252,7 +252,7 @@ class LoggingTests(AgentFixture):
             self.lib.log(json.dumps({'Authorization':value}),level)
         self.lib.flushLogging(timeout=3)
         self.assertNotIn(value,self.log_output());self.assertEqual([],self.requests.calls)
-        path=self.root/'davra_agent_TLS_1_3.log'
+        path=self.root/'davra_agent_TLS_1_4.log'
         self.assertNotIn(value,path.read_text())
 
     def test_summary_reports_zero_errors_and_does_not_send_http(self):

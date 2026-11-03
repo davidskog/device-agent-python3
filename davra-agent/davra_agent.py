@@ -1086,9 +1086,12 @@ def main(debugSeconds=0):
         finally:
             comDavra.logEvent('agent_stopped', version=comDavra.davraAgentVersion)
             closed = comDavra.closeLogging(timeout=5)
+            transportClosed = comDavra.closeHttpTransport()
+            if not transportClosed['clean']:
+                print('<3>ERROR: HTTP-anslutningar kunde inte avslutas rent', flush=True)
             if not closed['clean']:
                 print('<3>ERROR: Loggning hann inte avslutas; processens återstående trådar stängs', flush=True)
-    return 0 if closed['clean'] else 1
+    return 0 if closed['clean'] and transportClosed['clean'] else 1
 
 
 def parseAgentArguments(argv):

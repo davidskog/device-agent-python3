@@ -32,7 +32,7 @@ def main():
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'davraAgentVersion'
                                                for t in node.targets):
             version = ast.literal_eval(node.value)
-    if version != 'TLS_1_3':
+    if version != 'TLS_1_4':
         raise SystemExit('Unexpected Agent version')
     manifest = {'version': version, 'repository': 'davidskog/device-agent-python3',
                 'sourceGitSha': commit, 'files': [
@@ -41,7 +41,7 @@ def main():
                 'upgradePaths': ['davra-agent/davra_agent.py', 'davra-agent/davra_lib.py'],
                 'configIncluded': False, 'dependenciesChanged': False}
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
-    blobs['TLS_1_3-release.json'] = manifest_bytes
+    blobs['TLS_1_4-release.json'] = manifest_bytes
     archive = io.BytesIO()
     with gzip.GzipFile(filename='', mode='wb', fileobj=archive, mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode='w') as tar:
@@ -54,8 +54,8 @@ def main():
                 tar.addfile(info, io.BytesIO(raw))
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    name = 'davra-agent-TLS_1_3.tar.gz'
-    for filename, raw in ((name, archive.getvalue()), ('TLS_1_3-release.json', manifest_bytes),
+    name = 'davra-agent-TLS_1_4.tar.gz'
+    for filename, raw in ((name, archive.getvalue()), ('TLS_1_4-release.json', manifest_bytes),
                           (name + '.sha256', (hashlib.sha256(archive.getvalue()).hexdigest() +
                                              '  ' + name + '\n').encode())):
         with (output / filename).open('xb') as stream:

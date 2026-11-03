@@ -1,7 +1,7 @@
 # Davra Device Agent (Python 3)
 
 This is the TLS tenant's fork, `davidskog/device-agent-python3`. Our current
-Agent release is **TLS_1_3**. See [release and upgrade notes](docs/TLS_1_3.md).
+Agent release is **TLS_1_4**. See [release and upgrade notes](docs/TLS_1_4.md).
 The upstream support notice below applies to the inherited Davra codebase.
 
 > **Open Source — Unsupported Release**
@@ -82,16 +82,16 @@ For a separately planned **new installation**, use the versioned artifact from
 our fork. Verify its checksum before extraction:
 
 ```bash
-curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_3/davra-agent-TLS_1_3.tar.gz
-curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_3/davra-agent-TLS_1_3.tar.gz.sha256
-sha256sum -c davra-agent-TLS_1_3.tar.gz.sha256
-tar -xzf davra-agent-TLS_1_3.tar.gz
+curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_4/davra-agent-TLS_1_4.tar.gz
+curl -fLO https://github.com/davidskog/device-agent-python3/releases/download/TLS_1_4/davra-agent-TLS_1_4.tar.gz.sha256
+sha256sum -c davra-agent-TLS_1_4.tar.gz.sha256
+tar -xzf davra-agent-TLS_1_4.tar.gz
 sudo davra-agent/install.sh
 ```
 
 **Existing configured hosts:** do not use this installer as an upgrade. It
 installs dependencies and runs setup. Use the two-file, config-preserving
-upgrade described in [TLS_1_3](docs/TLS_1_3.md). The inherited installer's older
+upgrade described in [TLS_1_4](docs/TLS_1_4.md). The inherited installer's older
 dependency/platform assumptions are unchanged; new-host provisioning must
 qualify those separately. Python/Paho versions on VK2/VK1/VK4 are preserved.
 
@@ -493,16 +493,16 @@ See `LICENSE` file for terms. This software is provided as-is. Davra accepts no 
 
 > **Reminder:** This project is provided as an open-source reference only. **Davra does not offer support, maintenance, or security updates for this repository.** Community contributions are welcome but will not be actively reviewed.
 
-## TLS_1_3 diagnostic logging
+## TLS_1_4 diagnostic logging
 
-TLS_1_3 filters DEBUG by default, consolidates normal telemetry into a five-minute
+TLS_1_4 filters DEBUG by default, consolidates normal telemetry into a five-minute
 local summary and isolates local/remote diagnostic sinks from MQTT callbacks.
 First faults and real recovery remain visible; repeated faults carry bounded
 counts. Command results distinguish device completion from HTTP reporting.
-See [the logging and upgrade contract](docs/TLS_1_3.md). The first upgrade target
+See [the logging and upgrade contract](docs/TLS_1_4.md). The first upgrade target
 for this release is VK2; other device upgrades require their own authority.
 
-The version-owned local mirror is `davra_agent_TLS_1_3.log` in the existing log
+The version-owned local mirror is `davra_agent_TLS_1_4.log` in the existing log
 directory, with two bounded backups. Previous-version logs are not removed.
 Structured fields never include tokens, full configuration, scripts or response
 bodies. Legacy free-form log messages are not serialized.
