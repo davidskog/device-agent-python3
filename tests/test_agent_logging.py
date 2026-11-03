@@ -68,7 +68,7 @@ class LoggingTests(AgentFixture):
             calls.append(record);entered.set();release.wait(2)
             return types.SimpleNamespace(status_code=503)
         log = self.logger(remote)
-        started = time.monotonic();log.emit('agent_started', forward=True, version='TLS_1_2')
+        started = time.monotonic();log.emit('agent_started', forward=True, version='TLS_1_3')
         self.assertLess(time.monotonic()-started, .2);self.assertTrue(entered.wait(1))
         log.emit('command_received', function_uuid='11111111-1111-4111-8111-111111111111', function='drink')
         deadline=time.monotonic()+1
@@ -148,12 +148,12 @@ class LoggingTests(AgentFixture):
             row={'event':'diagnostic','level':level,'fields':{},'at':1}
             self.lib._write_local_log(row)
             self.assertIn('<'+str(priority)+'>',self.output.getvalue())
-        path=self.root/'davra_agent_TLS_1_2.log';self.assertEqual(0o600,path.stat().st_mode&0o777)
+        path=self.root/'davra_agent_TLS_1_3.log';self.assertEqual(0o600,path.stat().st_mode&0o777)
         self.assertFalse((self.root/'davra_agent.log').exists())
 
     def test_symlink_log_destination_is_not_followed(self):
         secret=self.root/'protected';secret.write_text('unchanged')
-        (self.root/'davra_agent_TLS_1_2.log').symlink_to(secret)
+        (self.root/'davra_agent_TLS_1_3.log').symlink_to(secret)
         with self.assertRaises(OSError):self.lib._write_local_log({'event':'diagnostic','level':'INFO','fields':{},'at':1})
         self.assertEqual('unchanged',secret.read_text())
 
@@ -252,7 +252,7 @@ class LoggingTests(AgentFixture):
             self.lib.log(json.dumps({'Authorization':value}),level)
         self.lib.flushLogging(timeout=3)
         self.assertNotIn(value,self.log_output());self.assertEqual([],self.requests.calls)
-        path=self.root/'davra_agent_TLS_1_2.log'
+        path=self.root/'davra_agent_TLS_1_3.log'
         self.assertNotIn(value,path.read_text())
 
     def test_summary_reports_zero_errors_and_does_not_send_http(self):
@@ -263,3 +263,34 @@ class LoggingTests(AgentFixture):
         self.assertEqual(0,summary['fields']['http_failed'])
         self.assertEqual(0,summary['fields']['telemetry_batches_failed'])
         self.assertEqual(0,summary['fields']['local_dropped'])
+
+    def test_argument_parser_accepts_exact_legacy_unit_without_mutating_argv(self):
+        legacy=['>>','/var/log/davra_agent.log','2>&1'];original=list(legacy)
+        self.assertEqual(0,self.agent.parseAgentArguments([]))
+        self.assertEqual(0,self.agent.parseAgentArguments(legacy));self.assertEqual(original,legacy)
+        self.assertEqual(10,self.agent.parseAgentArguments(['--debug-seconds','10']+legacy))
+        self.assertEqual(600,self.agent.parseAgentArguments(['--debug-seconds','600']))
+        for args in [['--unknown'],['>>','/other/log','2>&1'],['--debug-seconds','601'],
+                     ['--debug-seconds','-1'],['--debug-seconds','SECRET_ARG']]:
+            with self.assertRaises(ValueError):self.agent.parseAgentArguments(args)
+
+    def test_actual_entrypoint_with_committed_service_arguments(self):
+        import runpy,signal,shlex,sys
+        from pathlib import Path
+        source=Path(__file__).resolve().parents[1]/'davra-agent'
+        unit=(source/'davra_agent.service').read_text()
+        command=next(line.split('=',1)[1]for line in unit.splitlines()if line.startswith('ExecStart='))
+        argv=shlex.split(command)[2:]
+        self.assertEqual(['>>','/var/log/davra_agent.log','2>&1'],argv)
+        def install_handler(number,handler):
+            if number==signal.SIGTERM:handler(number,None)
+        with mock.patch.object(sys,'argv',[str(source/'davra_agent.py')]+argv),\
+             mock.patch('signal.signal',side_effect=install_handler),\
+             mock.patch.object(self.lib,'updateDeviceLabelOnServer'),\
+             mock.patch.object(self.lib,'registerDeviceCapability'):
+            with self.assertRaises(SystemExit)as closed:
+                runpy.run_path(str(source/'davra_agent.py'),run_name='__main__')
+        self.assertEqual(0,closed.exception.code)
+        self.assertIn('event=agent_started',self.log_output())
+        self.assertIn('event=agent_stopped',self.log_output())
+        self.assertTrue(all(not worker.is_alive()for worker in self.lib._logger.workers.values()))

@@ -1091,8 +1091,32 @@ def main(debugSeconds=0):
     return 0 if closed['clean'] else 1
 
 
+def parseAgentArguments(argv):
+    args = list(argv)
+    # The unchanged legacy unit passes shell-redirection tokens as literal
+    # Python arguments. The older Agent ignored argv; retain compatibility
+    # with precisely that unit without executing a shell or accepting extras.
+    legacy = ['>>', '/var/log/davra_agent.log', '2>&1']
+    if len(args) >= 3 and args[-3:] == legacy:
+        args = args[:-3]
+    if not args:
+        return 0
+    if args in (['-h'], ['--help']):
+        return None
+    if len(args) == 2 and args[0] == '--debug-seconds' and args[1].isdecimal():
+        seconds = int(args[1])
+        if 0 <= seconds <= 600:
+            return seconds
+    raise ValueError('invalid_agent_arguments')
+
+
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--debug-seconds', type=int, default=0, choices=range(0, 601), metavar='0..600')
-    sys.exit(main(parser.parse_args().debug_seconds))
+    try:
+        debugSeconds = parseAgentArguments(sys.argv[1:])
+    except ValueError:
+        print('<3>ERROR: Ogiltiga startargument för Davra Agent', file=sys.stderr, flush=True)
+        sys.exit(2)
+    if debugSeconds is None:
+        print('Davra Agent: --debug-seconds 0..600 (standard: 0)')
+        sys.exit(0)
+    sys.exit(main(debugSeconds))

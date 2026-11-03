@@ -325,7 +325,7 @@ class FunctionTests(AgentFixture):
         self.assertEqual('running', self.lib.readJsonFile(self.agent.currentJobJson)['devices'][0]['status'])
 
     def test_version_and_config_remain_separate(self):
-        self.assertEqual('TLS_1_2', self.lib.davraAgentVersion)
+        self.assertEqual('TLS_1_3', self.lib.davraAgentVersion)
         identifier = self.start()
         self.ack(identifier)
         self.assertEqual(self.original_config, (self.root / 'config.json').read_bytes())
@@ -336,7 +336,7 @@ class FunctionTests(AgentFixture):
         message = self.agent.clientOfDevice.published[-1][1]
         self.assertFalse(any(k.startswith('_') for k in message))
         self.assertEqual("O'Connor", message['functionParameterValues']['info'])
-        self.assertEqual('TLS_1_2', message['fromAgent'])
+        self.assertEqual('TLS_1_3', message['fromAgent'])
 
     def test_atomic_json_is_never_seen_truncated_by_a_reader(self):
         filename = str(self.root / 'shared.json')
@@ -386,16 +386,16 @@ class HttpAndLogTests(AgentFixture):
 
     def test_remote_log_failure_does_not_recurse(self):
         self.requests.failure = OSError('broken network')
-        self.lib.logEvent('agent_started', forward=True, version='TLS_1_2')
+        self.lib.logEvent('agent_started', forward=True, version='TLS_1_3')
         self.lib.flushLogging(timeout=3)
         self.assertEqual(1, len(self.requests.calls))
         self.assertIn('agent_started', self.log_output())
         self.assertIn('log_remote_failed', self.log_output())
 
     def test_missing_logfile_is_created(self):
-        self.lib.logEvent('agent_started', version='TLS_1_2')
+        self.lib.logEvent('agent_started', version='TLS_1_3')
         self.lib.flushLogging(timeout=3)
-        self.assertIn('agent_started', (self.root / 'davra_agent_TLS_1_2.log').read_text())
+        self.assertIn('agent_started', (self.root / 'davra_agent_TLS_1_3.log').read_text())
 
     def test_file_log_failure_does_not_prevent_console_or_return(self):
         with mock.patch('os.open', side_effect=PermissionError('synthetic')):
